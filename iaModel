@@ -1,0 +1,150 @@
+import pandas as pd
+import joblib
+from tensorflow.keras.models import load_model
+
+_model_red1 = None
+_preprocessor_red1 = None
+_le_banco = None
+_le_consejo = None
+_scaler_cuota = None
+_modelo_xgb = None
+_preprocessor_red2 = None
+
+def load_artitacts(
+        model_path_red1="C:/Users/Windows/Downloads/modelo_multitarea.h5",
+        preprocessor_path_red1="C:/Users/Windows/Downloads/preprocessor.pkl",
+        le_banco_path="C:/Users/Windows/Downloads/le_banco.pkl",
+        le_consejo_path="C:/Users/Windows/Downloads/le_consejo.pkl",
+        scaler_cuota_path="C:/Users/Windows/Downloads/scaler_cuota.pkl",
+        modelo_xgb_path="C:/Users/Windows/Desktop/MI GRAN PROYECTO/modelo_xgb_score.pkl",
+        preprocessor_path_red2="C:/Users/Windows/Desktop/MI GRAN PROYECTO\preprocessor_red2.pkl"
+):
+    global _model_red1, _preprocessor_red1, _le_banco, _le_consejo, _scaler_cuota, _modelo_xgb, _preprocessor_red2
+
+    if _model_red1 is None:
+        _model_red1 = load_model(model_path_red1, compile=False)
+    
+    if _preprocessor_red1 is None:
+        _preprocessor_red1 = joblib.load(preprocessor_path_red1)
+    
+    if _le_banco is None:
+        _le_banco = joblib.load(le_banco_path)
+    
+    if _le_consejo is None:
+        _le_consejo = joblib.load(le_consejo_path)
+    
+    if _scaler_cuota is None:
+        _scaler_cuota = joblib.load(scaler_cuota_path)
+    
+    if _modelo_xgb is None:
+        _modelo_xgb = joblib.load(modelo_xgb_path)
+    
+    if _preprocessor_red2 is None:
+        _preprocessor_red2 = joblib.load(preprocessor_path_red2)
+
+
+REQ_RED1 = ['Edad','Puntaje_Credito','Ingreso','Estado_Civil','Situacion_Laboral',
+            'Estatus_Legal','Banco_Cliente','tipo_prestamo','tipo_propiedad',
+            'Ciudad','tasa_interes','APR','banco']
+
+REQ_PROPS = ['Ciudad','Dirección','Precio','URL','Beds','Baths','Sqft']
+
+
+def _validate_cliente_df(df: pd.DataFrame):
+    faltan = [c for c in REQ_RED1 if c not in df.columns]
+    if faltan:
+        raise ValueError(f"Faltan columnas en cliente_df: {faltan}")
+    if len(df) != 1:
+        raise ValueError("cliente_df debe tener exactamente 1 fila.")
+
+
+def _validate_propiedades_df(df: pd.DataFrame):
+    faltan = [c for c in REQ_PROPS if c not in df.columns]
+    if faltan:
+        raise ValueError(f"Faltan columnas en propiedades_df: {faltan}")
+    
+
+import scipy.sparse
+
+
+def _predict_red1(cliente_df):
+
+    X = _preprocessor_red1.transform(cliente_df[REQ_RED1])
+    if scipy.sparse.issparse(X):
+        X = X.toarray()
+    pred_cuota, pred_banco, pred_consejo = _model_red1.predict(X)
+    cuota_real = _scaler_cuota.inverse_transform(pred_cuota).flatten()[0] 
+    banco_pred = _le_banco.inverse_transform(pred_banco.argmax(axus=1))[0]   
+    consejo_pred = _le_consejo.inverse_transform(pred_consejo.argmax(axis=1))[0]
+    return cuota_real, banco_pred, consejo_pred
+
+def _clean_propiedades(df_props: pd.DataFrame) -> pd.DataFrame:
+    df = df_props.copy()
+    df['Precio'] = (df['Precio'].astype(str).str.replace(',', '').str.replace('$','', regex=False))
+    df['Precio'] = pd.to.numeric(df['Precio'], errors='coerce')
+    df = df.dropna(subset=['Precio'])
+    for c in ['Beds', 'Baths', 'Sqft']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    df = df.dropna(subset=['Beds', 'Baths', 'Sqft'])
+    df = df.rename(columns={'Precio': 'precio_propiedad'})
+    return df
+
+FEATURES_NUM_2 = ['Edad','Puntaje_Credito','Ingreso','precio_propiedad','Beds','Baths','Sqft','cuota_predicha']
+FEATURES_CAT_2 =  ['Estado_Civil','Situacion_Laboral','Estatus_Legal','Banco_Cliente',
+                  'tipo_prestamo','tipo_propiedad','Ciudad','banco_predicho','consejo_predicho']   
+
+def _predict_scores(cliente_df, props_df):
+    X = _preprocessor_red2.transform(props_df[FEATURES_NUM_2 + FEATURES_CAT_2])
+    if scipy.sparse.issparse(X):
+        X = X.toarray()
+    scores = _modelo_xgb.predict_proba(X)
+    return scores
+
+# CAMBIAR
+
+
+def recomendar_para_app(cliente: dict, propiedades_df: pd.DataFrame, top_k: int = 5) -> list[dict]:
+    """
+    API de la IA para la app (sin DB): recibe un dict de cliente + DataFrame de propiedades,
+    devuelve lista de dicts lista para UI.
+    """
+    load_artifacts()  # se carga una vez
+    cliente_df = pd.DataFrame([cliente])
+    _validate_cliente_df(cliente_df)
+    _validate_propiedades_df(propiedades_df)
+
+    cuota, banco_pred, consejo_pred = _predict_red1(cliente_df)
+    props = _clean_propiedades(propiedades_df)
+
+    # Añade columnas derivadas esperadas por Red2
+    props = props.assign(
+        Edad=cliente_df.loc[0,'Edad'],
+        Puntaje_Credito=cliente_df.loc[0,'Puntaje_Credito'],
+        Ingreso=cliente_df.loc[0,'Ingreso'],
+        Estado_Civil=cliente_df.loc[0,'Estado_Civil'],
+        Situacion_Laboral=cliente_df.loc[0,'Situacion_Laboral'],
+        Estatus_Legal=cliente_df.loc[0,'Estatus_Legal'],
+        Banco_Cliente=cliente_df.loc[0,'Banco_Cliente'],
+        tipo_prestamo=cliente_df.loc[0,'tipo_prestamo'],
+        tipo_propiedad=cliente_df.loc[0,'tipo_propiedad'],
+        Ciudad=props['Ciudad'],  # mantenemos la de la propiedad
+        cuota_predicha=cuota,
+        banco_predicho=banco_pred,
+        consejo_predicho=consejo_pred,
+    )
+
+    scores = _predict_scores(cliente_df, props)
+    props = props.assign(score_predicho=scores)
+
+    cols_out = ['Ciudad','Dirección','precio_propiedad','Beds','Baths','Sqft','score_predicho','URL']
+    props = props.sort_values('score_predicho', ascending=False)
+    top = props[cols_out].head(top_k)
+
+    return top.to_dict(orient='records')
+
+
+
+
+
+
+
